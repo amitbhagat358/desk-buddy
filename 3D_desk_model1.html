@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Desk Buddy: Command Center</title>
+    <style>
+        body { margin: 0; padding: 0; width: 100vw; height: 100vh; font-family: sans-serif; background-color: #111; overflow: hidden; color: white;}
+        
+        /* The 3D scene now takes up the entire screen */
+        #main-canvas { width: 100%; height: 100%; position: absolute; top: 0; left: 0; z-index: 1;} 
+        
+        #ui {
+            position: absolute; top: 30px; left: 30px; background: rgba(10, 10, 10, 0.85);
+            padding: 25px; border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.9); z-index: 10; 
+            border: 1px solid rgba(255,255,255,0.1); backdrop-filter: blur(12px); min-width: 250px;
+        }
+        
+        h2 { margin-top: 0; color: #fff; letter-spacing: 1px; font-weight: 600; border-bottom: 1px solid #333; padding-bottom: 10px;}
+        .data-row { margin-top: 18px; font-weight: bold; font-size: 1.15em; color: #ddd; display: flex; align-items: center; justify-content: space-between;}
+        
+        .status-badge { 
+            font-size: 0.7em; padding: 4px 10px; border-radius: 12px; margin-left: 15px; 
+            text-transform: uppercase; letter-spacing: 0.5px; font-weight: bold;
+            background: rgba(255,255,255,0.1); color: #aaa; border: 1px solid #444;
+        }
+
+        .alert { color: #ff3333; font-size: 1.1em; display: none; margin-top: 25px; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; animation: blink 1s infinite; text-align: center;}
+        @keyframes blink { 50% { opacity: 0.4; } }
+        
+        #status { color: #888; font-size: 0.85em; margin-bottom: 20px; font-weight: bold; text-transform: uppercase; letter-spacing: 1px;}
+    </style>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
+</head>
+<body>
+    
+    <div id="ui">
+        <h2>Desk Buddy: Twin</h2>
+        <div id="status">🔴 Offline</div>
+        
+        <div class="data-row"><span>🌡️ Temp:</span> <span id="tempValue">-- °C</span></div>
+        <div class="data-row"><span>💨 CO2:</span> <div><span id="co2Value">--</span> <span id="co2Badge" class="status-badge">WAIT</span></div></div>
+        <div class="data-row"><span>💡 Lux:</span> <div><span id="luxValue">--</span> <span id="luxBadge" class="status-badge">WAIT</span></div></div>
+        
+        <div class="data-row" style="color: #00ffff; margin-top: 30px; border-top: 1px solid #333; padding-top: 15px;">
+            <span>🚀 Productivity:</span> <span id="aiValue">-- %</span>
+        </div>
+        
+        <div id="fatigueAlert" class="alert">⚠️ High Fatigue Risk!</div>
+    </div>
+
+    <div id="main-canvas"></div>
+
+    <script>
+        // --- 1. CLOUD CREDENTIALS ---
+        const brokerUrl = 'wss://7e790fa080b94fa5b2cc5991533287b3.s1.eu.hivemq.cloud:8884/mqtt'; 
+        const mqttOptions = {
+            username: 'roboism', 
+            password: '@Roboism123', 
+            clientId: 'WebTwin_' + Math.random().toString(16).substr(2, 8)
+        };
+
+        // --- 2. Setup 3D Scene ---
+        const container = document.getElementById('main-canvas');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x121212); 
+        
+        // Adjust camera aspect ratio for full screen
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const fullDeskGroup = new THREE.Group();
+        scene.add(fullDeskGroup);
+
+        // --- ENVIRONMENT ---
+        const tableTop = new THREE.Mesh(new THREE.BoxGeometry(6, 0.2, 3), new THREE.MeshStandardMaterial({ color: 0x8B5A2B, roughness: 0.7 }));
+        tableTop.receiveShadow = true; 
+        fullDeskGroup.add(tableTop);
+
+        const wall = new THREE.Mesh(new THREE.PlaneGeometry(12, 8), new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 1 }));
+        wall.position.set(0, 3, -1.5);
+        wall.receiveShadow = true;
+        fullDeskGroup.add(wall);
+
+        const legGeometry = new THREE.BoxGeometry(0.2, 2.5, 0.2);
+        const legMaterial = new THREE.MeshStandardMaterial({ color: 0x0a0a0a });
+        const positions = [[-2.8, -1.35, -1.3], [2.8, -1.35, -1.3], [-2.8, -1.35, 1.3], [2.8, -1.35, 1.3]];
+        positions.forEach(pos => {
+            const leg = new THREE.Mesh(legGeometry, legMaterial);
+            leg.position.set(...pos);
+            fullDeskGroup.add(leg); 
+        });
+
+        // --- CO2 MONITOR BOX ---
+        const co2Monitor = new THREE.Mesh(
+            new THREE.BoxGeometry(0.4, 0.9, 0.4), 
+            new THREE.MeshStandardMaterial({ color: 0x444444, roughness: 0.3, metalness: 0.2 })
+        );
+        co2Monitor.position.set(-2.0, 0.55, 0.5); 
+        co2Monitor.castShadow = true;
+        co2Monitor.receiveShadow = true;
+        fullDeskGroup.add(co2Monitor);
+
+        // --- THE MECHANICAL LAMP ---
+        const lamp = new THREE.Group();
+        const lampMat = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, roughness: 0.4, metalness: 0.3 });
+
+        const base = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.45, 0.15, 32), lampMat);
+        base.position.set(0, 0.175, 0); 
+        base.castShadow = true;
+        lamp.add(base);
+
+        const lowerArm = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 1.4, 16), lampMat);
+        lowerArm.position.set(-0.35, 0.8, 0);
+        lowerArm.rotation.z = Math.PI / 6; 
+        lowerArm.castShadow = true;
+        lamp.add(lowerArm);
+
+        const midJoint = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.12, 16), lampMat);
+        midJoint.position.set(-0.7, 1.4, 0);
+        midJoint.rotation.x = Math.PI / 2;
+        lamp.add(midJoint);
+
+        const upperArm = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 1.2, 16), lampMat);
+        upperArm.position.set(-1.25, 1.6, 0);
+        upperArm.rotation.z = Math.PI / 2.5; 
+        upperArm.castShadow = true;
+        lamp.add(upperArm);
+
+        const headJoint = new THREE.Mesh(new THREE.SphereGeometry(0.1, 16, 16), lampMat);
+        headJoint.position.set(-1.8, 1.8, 0);
+        lamp.add(headJoint);
+
+        const shade = new THREE.Mesh(new THREE.SphereGeometry(0.35, 32, 16, 0, Math.PI * 2, 0, Math.PI / 1.5), lampMat);
+        shade.position.set(-2.0, 1.65, 0);
+        shade.rotation.z = Math.PI / 4; 
+        shade.castShadow = true;
+        lamp.add(shade);
+
+        const bulbMaterial = new THREE.MeshBasicMaterial({ color: 0x444444 }); 
+        const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.1, 16, 16), bulbMaterial);
+        bulb.position.set(-1.95, 1.7, 0); 
+        lamp.add(bulb);
+
+        const spotLight = new THREE.SpotLight(0xffeedd, 6, 20, Math.PI / 5, 0.5, 1);
+        spotLight.position.set(-1.95, 1.6, 0); 
+        spotLight.castShadow = true;
+        spotLight.shadow.mapSize.width = 1024;
+        spotLight.shadow.mapSize.height = 1024;
+        
+        spotLight.target.position.set(-3.5, 0.1, 0); 
+        scene.add(spotLight.target); 
+        lamp.add(spotLight);
+        
+        lamp.position.set(1.5, 0, -0.5); 
+        fullDeskGroup.add(lamp); 
+
+        // --- LIGHTING ---
+        scene.add(new THREE.AmbientLight(0xffffff, 0.05)); 
+        const fillLight = new THREE.DirectionalLight(0xffffff, 0.25); 
+        fillLight.position.set(0, 5, 5); 
+        scene.add(fillLight);
+
+        // --- CAMERA ANGLE ---
+        // Shifted slightly right so the UI box on the left doesn't block the view
+        fullDeskGroup.position.x = 0.5; 
+        fullDeskGroup.rotation.y = -0.15; 
+        camera.position.set(0, 2.5, 8.5); 
+        camera.lookAt(0.5, 0.5, 0); 
+
+        // --- UI BADGE HELPER FUNCTION ---
+        function updateBadge(elementId, text, colorCode) {
+            const badge = document.getElementById(elementId);
+            badge.innerText = text;
+            badge.style.color = colorCode;
+            badge.style.border = `1px solid ${colorCode}`;
+            badge.style.background = `${colorCode}22`;
+        }
+
+        // --- 3. Connect to HiveMQ ---
+        const client = mqtt.connect(brokerUrl, mqttOptions);
+        
+        client.on('connect', () => {
+            document.getElementById('status').innerText = '🟢 Connected to HiveMQ';
+            document.getElementById('status').style.color = "#00ff00";
+            
+            client.subscribe('deskbuddy/telemetry'); 
+            client.subscribe('deskbuddy/ai_prediction');
+        });
+
+        client.on('error', (err) => {
+            document.getElementById('status').innerText = '🔴 Connection Error!';
+            document.getElementById('status').style.color = "red";
+        });
+
+        // --- 4. Handle Incoming Live Data ---
+        client.on('message', (topic, message) => {
+            let data = JSON.parse(message.toString());
+            
+            // AI PREDICTION LOGIC
+            if (topic === 'deskbuddy/ai_prediction') {
+                
+                // Update the text to show Productivity
+                document.getElementById('aiValue').innerText = data.productivity_score.toFixed(1) + ' %';
+                
+                const aiRow = document.getElementById('aiValue').parentElement;
+                const alertBox = document.getElementById('fatigueAlert'); 
+                
+                // If Python sent an extreme alert message (Temp/CO2 out of bounds)
+                if (data.alert !== "none") {
+                    aiRow.style.color = "#ff3333"; // Turn text red
+                    alertBox.innerText = data.alert; // Show the specific Python error
+                    alertBox.style.display = 'block';
+                } 
+                // If everything is normal and good
+                else {
+                    aiRow.style.color = "#00ff00"; // Turn text green
+                    // Only hide the alert if the raw CO2 sensor isn't also triggering a danger warning
+                    if (document.getElementById('co2Badge').innerText !== 'DANGER') {
+                        alertBox.style.display = 'none';
+                    }
+                }
+                return;
+            }
+
+            // TELEMETRY LOGIC
+            if (topic === 'deskbuddy/telemetry') {
+                document.getElementById('tempValue').innerText = (data.temperature || "--") + " °C";
+                document.getElementById('co2Value').innerText = data.co2 || "--";
+                document.getElementById('luxValue').innerText = data.lux || "--";
+
+                // LUX LOGIC (Lamp)
+                if (data.lux < 150) {
+                    spotLight.color.setHex(0xff0000); bulbMaterial.color.setHex(0xff0000); 
+                    updateBadge('luxBadge', 'TOO LOW', '#ff3333');
+                } else if (data.lux < 300) {
+                    spotLight.color.setHex(0xffaa00); bulbMaterial.color.setHex(0xffaa00); 
+                    updateBadge('luxBadge', 'DIM', '#ffaa00');
+                } else if (data.lux < 500) {
+                    spotLight.color.setHex(0xffeedd); bulbMaterial.color.setHex(0xffeedd); 
+                    updateBadge('luxBadge', 'GOOD', '#00ff00');
+                } else {
+                    spotLight.color.setHex(0xffffff); bulbMaterial.color.setHex(0xffffff); 
+                    updateBadge('luxBadge', 'IDEAL', '#00ffff');
+                }
+
+                // CO2 LOGIC (Smart Box)
+                if (data.co2 < 600) {
+                    co2Monitor.material.color.setHex(0x00ffff); 
+                    updateBadge('co2Badge', 'IDEAL', '#00ffff');
+                    document.getElementById('fatigueAlert').style.display = 'none';
+                } else if (data.co2 < 1000) {
+                    co2Monitor.material.color.setHex(0x00ff00); 
+                    updateBadge('co2Badge', 'GOOD', '#00ff00');
+                    document.getElementById('fatigueAlert').style.display = 'none';
+                } else if (data.co2 < 1500) {
+                    co2Monitor.material.color.setHex(0xffaa00); 
+                    updateBadge('co2Badge', 'WARNING', '#ffaa00');
+                    document.getElementById('fatigueAlert').style.display = 'none';
+                } else {
+                    co2Monitor.material.color.setHex(0xff0000); 
+                    updateBadge('co2Badge', 'DANGER', '#ff3333');
+                    document.getElementById('fatigueAlert').style.display = 'block';
+                }
+            }
+        });
+
+        // --- 5. Render Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // Ensure full screen on resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
